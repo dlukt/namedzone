@@ -76,6 +76,23 @@ func main() {
 }
 ```
 
+```go
+cfg, err := namedzone.Load("/etc/bind/named.conf") // expands *.conf includes by default
+if err != nil { panic(err) }
+
+// Create a zone inside the "internal" view:
+_ = cfg.CreateInView(namedzone.Zone{
+    Name:  "example.org",
+    Class: "IN",
+    Type:  "master",
+    File:  "/etc/bind/zones/db.example.org",
+}, "internal")
+
+// Persist to all touched files (/etc/bind/named.conf and matched *.conf files)
+if err := cfg.SaveAll(); err != nil { panic(err) }
+
+```
+
 ### Typed fields on `Zone`
 
 - Address-match lists (`*namedconf.MatchGroup`): `AllowQuery`, `AllowUpdate`, `AllowTransfer`, `AllowNotify`, `AlsoNotify`, `Masters`, `Forwarders`

@@ -1,52 +1,128 @@
-
 package namedzone
 
 import (
 	"fmt"
-	"net"
 	"os"
+	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 
 	nc "github.com/dlukt/namedconf"
 )
 
-// Config wraps a parsed named.conf and provides zone CRUD helpers (view-aware).
-type Config struct {
-	Path string
-	File *nc.File
+// LoadOptions configures how Load behaves.
+type LoadOptions struct {
+	// InlineIncludes makes the parser inline regular includes. Defaults to true.
+	InlineIncludes bool
+	// ExpandGlobs expands include paths containing '*' or '?', parsing the matched files.
+	// Defaults to true.
+	ExpandGlobs bool
 }
 
-// Load parses a named.conf from disk.
-func Load(path string) (*Config, error) {
-	f, err := nc.ParseFile(path, nil)
+// Config wraps one or more parsed named.conf files
+// and provides zone CRUD helpers across them.
+type Config struct {
+	RootPath string
+	Root     *nc.File
+	Files    map[string]*nc.File // absolute path -> parsed file
+}
+
+// Load parses a named.conf from disk with sane defaults
+// (inline includes + expand wildcard include paths).
+func Load(path string) (*Config, error) { return LoadWith(path, nil) }
+
+func LoadWith(path string, opts *LoadOptions) (*Config, error) {
+	if opts == nil {
+		opts = &LoadOptions{InlineIncludes: true, ExpandGlobs: true}
+	}
+	root, err := nc.ParseFile(path, &nc.ParseOptions{InlineIncludes: opts.InlineIncludes})
 	if err != nil {
 		return nil, err
 	}
-	return &Config{Path: path, File: f}, nil
+	cfg := &Config{
+		RootPath: path,
+		Root:     root,
+		Files:    map[string]*nc.File{},
+	}
+	cfg.Files[abs(path)] = root
+
+	// Gather include paths and expand globs if asked.
+	if opts.ExpandGlobs {
+		baseDir := filepath.Dir(abs(path))
+		for _, inc := range cfg.findIncludePaths(root) {
+			p := inc
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(baseDir, inc)
+			}
+			p = filepath.Clean(p)
+			if hasGlob(p) {
+				matches, _ := filepath.Glob(p)
+				sort.Strings(matches)
+				for _, m := range matches {
+					mAbs := abs(m)
+					if _, seen := cfg.Files[mAbs]; seen {
+						continue
+					}
+					if f, err := nc.ParseFile(mAbs, &nc.ParseOptions{InlineIncludes: opts.InlineIncludes}); err == nil {
+						cfg.Files[mAbs] = f
+					}
+				}
+			} else if !opts.InlineIncludes {
+				// If not inlining, also parse regular includes so SaveAll can write them.
+				pAbs := abs(p)
+				if _, seen := cfg.Files[pAbs]; !seen {
+					if f, err := nc.ParseFile(pAbs, &nc.ParseOptions{InlineIncludes: false}); err == nil {
+						cfg.Files[pAbs] = f
+					}
+				}
+			}
+		}
+	}
+	return cfg, nil
 }
 
-// Save writes the current AST back to Path (atomically via temp file + rename).
-func (c *Config) Save() error {
-	if c.Path == "" || c.File == nil {
-		return fmt.Errorf("invalid config: missing Path or File")
+func abs(p string) string {
+	a, err := filepath.Abs(p)
+	if err != nil {
+		return p
 	}
-	tmp := c.Path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(c.File.String()), 0o644); err != nil {
+	return a
+}
+
+func hasGlob(p string) bool { return strings.ContainsAny(p, "*?") }
+
+// Save writes only the root file.
+func (c *Config) Save() error {
+	return atomicWrite(c.Root.Path, []byte(c.Root.String()), 0o644)
+}
+
+// SaveAll writes every parsed file back to disk (atomic temp+rename).
+func (c *Config) SaveAll() error {
+	for _, f := range c.Files {
+		if err := atomicWrite(f.Path, []byte(f.String()), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func atomicWrite(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.Path)
+	return os.Rename(tmp, path)
 }
 
-// Zone models a zone { ... } block commonly found in named.conf.
+// Zone represents a zone { ... } block.
 type Zone struct {
-	// Header
-	Name  string // "example.com"
-	Class string // "IN" (optional; empty means omit)
-	Type  string // master|slave|hint|stub|forward|redirect (not validated)
-	File  string // path to zone file (if applicable)
+	Name  string
+	Class string
+	Type  string // master|slave|hint|stub|forward|redirect
+	File  string
 
-	// Address-match lists (rendered as single-arg MatchGroup)
+	// Typed fields for common directives
 	AllowQuery    *nc.MatchGroup
 	AllowUpdate   *nc.MatchGroup
 	AllowTransfer *nc.MatchGroup
@@ -55,70 +131,130 @@ type Zone struct {
 	Masters       *nc.MatchGroup
 	Forwarders    *nc.MatchGroup
 
-	// Simple fields
-	Forward string // "only"|"first"
-	Notify  string // "yes"|"no"|"explicit"
+	Forward string // only|first
+	Notify  string // yes|no|explicit
 
-	// Booleans
-	InlineSigning       *bool // yes|no
-	IXFRFromDifferences *bool // yes|no
-	NotifyToSoa         *bool // yes|no
+	InlineSigning       *bool
+	IXFRFromDifferences *bool
+	NotifyToSoa         *bool
 
-	// Strings
-	AutoDNSSEC   string // off|allow|maintain (string to be future-proof)
-	DNSSECPolicy string // policy name
-	Journal      string // quoted path
-	MaxJournalSize string // raw token like 1G, 250M
+	AutoDNSSEC     string
+	DNSSECPolicy   string
+	Journal        string
+	MaxJournalSize string
 
-	// Complex blocks preserved as-is
-	UpdatePolicy *nc.Block
+	UpdatePolicy *nc.Block // keep raw
 
-	// Unknown/less common directives preserved as name -> occurrences -> args
 	Extras map[string][][]string
 
 	// internal
-	ast *nc.Directive
+	filePath string // which file this zone lives in
+	ast      *nc.Directive
 }
 
-// ---------- High-level API (top-level zones) ----------
+// ========== View helpers ==========
 
+func isView(d *nc.Directive) (string, bool) {
+	if !strings.EqualFold(d.Name, "view") {
+		return "", false
+	}
+	if len(d.Args) == 0 {
+		return "", false
+	}
+	switch v := d.Args[0].(type) {
+	case nc.StringLit:
+		return v.Value, true
+	case nc.Ident:
+		return v.Value, true
+	default:
+		return "", false
+	}
+}
+
+// List returns all top-level zones across all files.
 func (c *Config) List() []Zone { return c.ListInView("") }
-func (c *Config) Get(name string) *Zone { return c.GetInView(name, "") }
-func (c *Config) Create(z Zone) error { return c.CreateInView(z, "") }
-func (c *Config) Update(name string, fn func(*Zone) error) error { return c.UpdateInView(name, "", fn) }
-func (c *Config) Delete(name string) bool { return c.DeleteInView(name, "") }
 
-// ---------- View-aware API ----------
-
-// ListInView returns all zones in the given view (empty string for top-level).
+// ListInView returns zones for the given view name (empty = top-level).
 func (c *Config) ListInView(view string) []Zone {
-	var zs []Zone
-	for _, zd := range c.zonesIn(view) {
-		if len(zd.Args) >= 1 {
-			if name, ok := zd.Args[0].(nc.StringLit); ok {
-				z := zoneFromDirective(zd, name.Value)
-				zs = append(zs, z)
+	var out []Zone
+	for _, f := range c.Files {
+		if view == "" {
+			for _, d := range f.Directives {
+				if isZone(d) {
+					z := zoneFromDirective(d, srcName(d), f.Path)
+					out = append(out, z)
+				}
+			}
+			continue
+		}
+		// scan views
+		for _, d := range f.Directives {
+			if vname, ok := isView(d); ok && vname == view && d.Block != nil {
+				for _, cd := range d.Block.Directives {
+					if isZone(cd) {
+						z := zoneFromDirective(cd, srcName(cd), f.Path)
+						out = append(out, z)
+					}
+				}
 			}
 		}
 	}
-	return zs
+	return out
 }
 
-// GetInView finds a zone by name in the given view (empty for top-level).
+func isZone(d *nc.Directive) bool {
+	return strings.EqualFold(d.Name, "zone") && len(d.Args) >= 1
+}
+
+func srcName(d *nc.Directive) string {
+	if len(d.Args) == 0 {
+		return ""
+	}
+	if s, ok := d.Args[0].(nc.StringLit); ok {
+		return s.Value
+	}
+	if id, ok := d.Args[0].(nc.Ident); ok {
+		return id.Value
+	}
+	return ""
+}
+
+// Get finds a top-level zone by name across files.
+func (c *Config) Get(name string) *Zone { return c.GetInView(name, "") }
+
+// GetInView finds a zone by name within a view (empty = top-level).
 func (c *Config) GetInView(name, view string) *Zone {
-	for _, d := range c.zonesIn(view) {
-		if len(d.Args) >= 1 {
-			if s, ok := d.Args[0].(nc.StringLit); ok && s.Value == name {
-				z := zoneFromDirective(d, name)
-				return &z
+	for _, f := range c.Files {
+		if view == "" {
+			for _, d := range f.Directives {
+				if isZone(d) && srcName(d) == name {
+					z := zoneFromDirective(d, name, f.Path)
+					return &z
+				}
+			}
+			continue
+		}
+		for _, d := range f.Directives {
+			if vname, ok := isView(d); ok && vname == view && d.Block != nil {
+				for _, cd := range d.Block.Directives {
+					if isZone(cd) && srcName(cd) == name {
+						z := zoneFromDirective(cd, name, f.Path)
+						return &z
+					}
+				}
 			}
 		}
 	}
 	return nil
 }
 
-// CreateInView creates a zone inside the given view (creates the view if missing).
-func (c *Config) CreateInView(z Zone, view string) error {
+// Create adds a top-level zone; chooses a reasonable target file.
+func (c *Config) Create(z Zone) error { return c.createInternal(z, "") }
+
+// CreateInView adds a zone inside the given view. Prefers file that already has that view.
+func (c *Config) CreateInView(z Zone, view string) error { return c.createInternal(z, view) }
+
+func (c *Config) createInternal(z Zone, view string) error {
 	if z.Name == "" {
 		return fmt.Errorf("zone name is required")
 	}
@@ -126,165 +262,303 @@ func (c *Config) CreateInView(z Zone, view string) error {
 		return fmt.Errorf("zone %q already exists in view %q", z.Name, view)
 	}
 	dir := zoneToDirective(z)
-	* c.zoneContainer(view) = append(*c.zoneContainer(view), dir)
+	target := c.chooseTargetFile(view)
+	if view == "" {
+		c.Files[target].Directives = append(c.Files[target].Directives, dir)
+	} else {
+		vd := ensureViewBlock(c.Files[target], view)
+		vd.Block.Directives = append(vd.Block.Directives, dir)
+	}
 	return nil
 }
 
-// UpdateInView finds the zone and lets fn mutate it.
+// Update mutates a top-level zone.
+func (c *Config) Update(name string, fn func(*Zone) error) error {
+	return c.UpdateInView(name, "", fn)
+}
+
+// UpdateInView mutates a zone in a specific view.
 func (c *Config) UpdateInView(name, view string, fn func(*Zone) error) error {
-	if fn == nil {
-		return fmt.Errorf("update function is nil")
-	}
-	cont := c.zoneContainer(view)
-	for i := range *cont {
-		d := (*cont)[i]
-		if strings.EqualFold(d.Name, "zone") && len(d.Args) >= 1 {
-			if s, ok := d.Args[0].(nc.StringLit); ok && s.Value == name {
-				z := zoneFromDirective(d, name)
-				if err := fn(&z); err != nil {
-					return err
+	for _, f := range c.Files {
+		if view == "" {
+			for i := range f.Directives {
+				d := f.Directives[i]
+				if isZone(d) && srcName(d) == name {
+					z := zoneFromDirective(d, name, f.Path)
+					if err := fn(&z); err != nil {
+						return err
+					}
+					f.Directives[i] = zoneToDirective(z)
+					f.Directives[i].Pos = d.Pos
+					return nil
 				}
-				(*cont)[i] = zoneToDirective(z)
-				return nil
+			}
+			continue
+		}
+		for i := range f.Directives {
+			d := f.Directives[i]
+			if vname, ok := isView(d); ok && vname == view && d.Block != nil {
+				for j := range d.Block.Directives {
+					cd := d.Block.Directives[j]
+					if isZone(cd) && srcName(cd) == name {
+						z := zoneFromDirective(cd, name, f.Path)
+						if err := fn(&z); err != nil {
+							return err
+						}
+						d.Block.Directives[j] = zoneToDirective(z)
+						d.Block.Directives[j].Pos = cd.Pos
+						return nil
+					}
+				}
 			}
 		}
 	}
 	return fmt.Errorf("zone %q not found in view %q", name, view)
 }
 
-// DeleteInView removes a zone; returns true if removed.
+// Delete removes a top-level zone.
+func (c *Config) Delete(name string) bool { return c.DeleteInView(name, "") }
+
+// DeleteInView removes a zone from a specific view.
 func (c *Config) DeleteInView(name, view string) bool {
-	cont := c.zoneContainer(view)
-	for i := range *cont {
-		d := (*cont)[i]
-		if strings.EqualFold(d.Name, "zone") && len(d.Args) >= 1 {
-			if s, ok := d.Args[0].(nc.StringLit); ok && s.Value == name {
-				*cont = slices.Delete(*cont, i, i+1)
-				return true
+	for _, f := range c.Files {
+		if view == "" {
+			for i := range f.Directives {
+				d := f.Directives[i]
+				if isZone(d) && srcName(d) == name {
+					f.Directives = slices.Delete(f.Directives, i, i+1)
+					return true
+				}
+			}
+			continue
+		}
+		for i := range f.Directives {
+			d := f.Directives[i]
+			if vname, ok := isView(d); ok && vname == view && d.Block != nil {
+				for j := range d.Block.Directives {
+					cd := d.Block.Directives[j]
+					if isZone(cd) && srcName(cd) == name {
+						d.Block.Directives = slices.Delete(d.Block.Directives, j, j+1)
+						return true
+					}
+				}
 			}
 		}
 	}
 	return false
 }
 
-// ---------- Internals ----------
-
-// zonesIn gets all zone directives in the given view.
-func (c *Config) zonesIn(view string) []*nc.Directive {
-	if view == "" {
-		var out []*nc.Directive
-		for _, d := range c.File.Directives {
-			if strings.EqualFold(d.Name, "zone") {
-				out = append(out, d)
+func (c *Config) chooseTargetFile(view string) string {
+	// Prefer a file that already has zones (top-level or in the view), else the root.
+	candidates := make([]string, 0, len(c.Files))
+	for p, f := range c.Files {
+		if view == "" {
+			for _, d := range f.Directives {
+				if isZone(d) {
+					candidates = append(candidates, p)
+					break
+				}
 			}
-		}
-		return out
-	}
-	// find view
-	for _, d := range c.File.Directives {
-		if strings.EqualFold(d.Name, "view") && len(d.Args) >= 1 {
-			if s, ok := d.Args[0].(nc.StringLit); ok && s.Value == view {
-				if d.Block == nil {
-					return nil
+		} else {
+			for _, d := range f.Directives {
+				if vname, ok := isView(d); ok && vname == view {
+					candidates = append(candidates, p)
+					break
 				}
-				var out []*nc.Directive
-				for _, cd := range d.Block.Directives {
-					if strings.EqualFold(cd.Name, "zone") {
-						out = append(out, cd)
-					}
-				}
-				return out
 			}
 		}
 	}
-	return nil
+	if len(candidates) == 0 {
+		return abs(c.RootPath)
+	}
+	sort.Strings(candidates)
+	return candidates[0]
 }
 
-// zoneContainer returns the slice of directives to append/modify for zones for a view.
-// If the view doesn't exist and view != "", it will be created.
-func (c *Config) zoneContainer(view string) *[]*nc.Directive {
-	if view == "" {
-		return &c.File.Directives
-	}
-	// search view
-	for _, d := range c.File.Directives {
-		if strings.EqualFold(d.Name, "view") && len(d.Args) >= 1 {
-			if s, ok := d.Args[0].(nc.StringLit); ok && s.Value == view {
-				if d.Block == nil {
-					d.Block = &nc.Block{}
-				}
-				return &d.Block.Directives
+func ensureViewBlock(f *nc.File, view string) *nc.Directive {
+	for _, d := range f.Directives {
+		if vname, ok := isView(d); ok && vname == view {
+			if d.Block == nil {
+				d.Block = &nc.Block{}
 			}
+			return d
 		}
 	}
-	// create view
-	v := &nc.Directive{
-		Name: "view",
-		Args: []nc.Expr{nc.StringLit{Value: view}},
+	// create new view
+	vd := &nc.Directive{
+		Name:  "view",
+		Args:  []nc.Expr{nc.StringLit{Value: view}},
 		Block: &nc.Block{},
 	}
-	c.File.Directives = append(c.File.Directives, v)
-	return &v.Block.Directives
+	f.Directives = append(f.Directives, vd)
+	return vd
 }
 
-// zoneFromDirective converts an AST zone directive to Zone struct.
-func zoneFromDirective(d *nc.Directive, name string) Zone {
+// ========== Include discovery ==========
+
+func (c *Config) findIncludePaths(f *nc.File) []string {
+	var paths []string
+	f.Walk(func(d *nc.Directive) bool {
+		if strings.EqualFold(d.Name, "include") && len(d.Args) == 1 {
+			if ie, ok := d.Args[0].(nc.IncludeExpr); ok && ie.Inc != nil {
+				paths = append(paths, ie.Inc.Path)
+			}
+		}
+		return true
+	})
+	return paths
+}
+
+// ========== Zone <-> AST ==========
+
+func zoneFromDirective(d *nc.Directive, name string, filePath string) Zone {
 	z := Zone{
-		Name:   name,
-		Class:  zoneClassFromArgs(d.Args),
-		Extras: map[string][][]string{},
-		ast:    d,
+		Name:     name,
+		Class:    zoneClassFromArgs(d.Args),
+		Type:     "",
+		File:     "",
+		Extras:   map[string][][]string{},
+		filePath: filePath,
+		ast:      d,
 	}
 	if d.Block != nil {
 		for _, cd := range d.Block.Directives {
 			switch strings.ToLower(cd.Name) {
 			case "type":
 				if len(cd.Args) >= 1 {
-					z.Type = rawToken(cd.Args[0])
+					switch a := cd.Args[0].(type) {
+					case nc.Ident:
+						z.Type = a.Value
+					case nc.StringLit:
+						z.Type = a.Value
+					}
 				}
 			case "file":
 				if len(cd.Args) >= 1 {
-					// store as raw string
-					z.File = rawToken(cd.Args[0])
+					switch a := cd.Args[0].(type) {
+					case nc.StringLit:
+						z.File = a.Value
+					case nc.Ident:
+						z.File = a.Value
+					}
 				}
 			case "allow-query":
-				if mg := asMatchGroup(cd); mg != nil { z.AllowQuery = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.AllowQuery = &mg
+					}
+				}
 			case "allow-update":
-				if mg := asMatchGroup(cd); mg != nil { z.AllowUpdate = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.AllowUpdate = &mg
+					}
+				}
 			case "allow-transfer":
-				if mg := asMatchGroup(cd); mg != nil { z.AllowTransfer = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.AllowTransfer = &mg
+					}
+				}
 			case "allow-notify":
-				if mg := asMatchGroup(cd); mg != nil { z.AllowNotify = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.AllowNotify = &mg
+					}
+				}
 			case "also-notify":
-				if mg := asMatchGroup(cd); mg != nil { z.AlsoNotify = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.AlsoNotify = &mg
+					}
+				}
 			case "masters":
-				if mg := asMatchGroup(cd); mg != nil { z.Masters = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.Masters = &mg
+					}
+				}
 			case "forwarders":
-				if mg := asMatchGroup(cd); mg != nil { z.Forwarders = mg }
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.Forwarders = &mg
+					}
+				}
 			case "forward":
 				if len(cd.Args) >= 1 {
-					z.Forward = strings.ToLower(rawToken(cd.Args[0]))
+					if id, ok := cd.Args[0].(nc.Ident); ok {
+						z.Forward = id.Value
+					} else if s, ok := cd.Args[0].(nc.StringLit); ok {
+						z.Forward = s.Value
+					}
 				}
 			case "notify":
 				if len(cd.Args) >= 1 {
-					z.Notify = strings.ToLower(rawToken(cd.Args[0]))
+					if id, ok := cd.Args[0].(nc.Ident); ok {
+						z.Notify = id.Value
+					} else if s, ok := cd.Args[0].(nc.StringLit); ok {
+						z.Notify = s.Value
+					} else if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						// Some configs use notify { ... }; treat as group stored in AllowNotify
+						z.AllowNotify = &mg
+					}
+				}
+			case "inline-signing":
+				if len(cd.Args) >= 1 {
+					if id, ok := cd.Args[0].(nc.Ident); ok {
+						val := strings.EqualFold(id.Value, "yes")
+						z.InlineSigning = &val
+					}
+				}
+			case "ixfr-from-differences":
+				if len(cd.Args) >= 1 {
+					if id, ok := cd.Args[0].(nc.Ident); ok {
+						val := strings.EqualFold(id.Value, "yes")
+						z.IXFRFromDifferences = &val
+					}
 				}
 			case "notify-to-soa":
-				if b, ok := asBool(cd); ok { z.NotifyToSoa = &b }
-			case "inline-signing":
-				if b, ok := asBool(cd); ok { z.InlineSigning = &b }
-			case "ixfr-from-differences":
-				if b, ok := asBool(cd); ok { z.IXFRFromDifferences = &b }
+				if len(cd.Args) >= 1 {
+					if id, ok := cd.Args[0].(nc.Ident); ok {
+						val := strings.EqualFold(id.Value, "yes")
+						z.NotifyToSoa = &val
+					}
+				}
 			case "auto-dnssec":
-				if len(cd.Args) >= 1 { z.AutoDNSSEC = rawToken(cd.Args[0]) }
+				if len(cd.Args) >= 1 {
+					if id, ok := cd.Args[0].(nc.Ident); ok {
+						z.AutoDNSSEC = id.Value
+					} else if s, ok := cd.Args[0].(nc.StringLit); ok {
+						z.AutoDNSSEC = s.Value
+					}
+				}
 			case "dnssec-policy":
-				if len(cd.Args) >= 1 { z.DNSSECPolicy = rawToken(cd.Args[0]) }
+				if len(cd.Args) >= 1 {
+					if s, ok := cd.Args[0].(nc.StringLit); ok {
+						z.DNSSECPolicy = s.Value
+					} else if id, ok := cd.Args[0].(nc.Ident); ok {
+						z.DNSSECPolicy = id.Value
+					}
+				}
 			case "journal":
-				if len(cd.Args) >= 1 { z.Journal = rawToken(cd.Args[0]) }
+				if len(cd.Args) >= 1 {
+					if s, ok := cd.Args[0].(nc.StringLit); ok {
+						z.Journal = s.Value
+					}
+				}
 			case "max-journal-size":
-				if len(cd.Args) >= 1 { z.MaxJournalSize = rawToken(cd.Args[0]) }
+				if len(cd.Args) >= 1 {
+					switch a := cd.Args[0].(type) {
+					case nc.NumberLit:
+						z.MaxJournalSize = a.Raw
+					case nc.Ident:
+						z.MaxJournalSize = a.Value
+					case nc.StringLit:
+						z.MaxJournalSize = a.Value
+					}
+				}
 			case "update-policy":
-				// keep block as-is
+				// Keep raw block if present
 				if cd.Block != nil {
 					z.UpdatePolicy = cd.Block
 				}
@@ -298,7 +572,6 @@ func zoneFromDirective(d *nc.Directive, name string) Zone {
 }
 
 func zoneClassFromArgs(args []nc.Expr) string {
-	// zone "example" IN { ... };
 	if len(args) >= 2 {
 		if id, ok := args[1].(nc.Ident); ok {
 			return id.Value
@@ -307,7 +580,6 @@ func zoneClassFromArgs(args []nc.Expr) string {
 	return ""
 }
 
-// zoneToDirective converts a Zone struct back to an AST directive.
 func zoneToDirective(z Zone) *nc.Directive {
 	args := []nc.Expr{nc.StringLit{Value: z.Name}}
 	if z.Class != "" {
@@ -316,94 +588,101 @@ func zoneToDirective(z Zone) *nc.Directive {
 	dir := &nc.Directive{
 		Name: "zone",
 		Args: args,
-		Pos:  nc.Position{},
 	}
 	blk := &nc.Block{}
 
-	// Basic
-	if z.Type != "" {
+	add := func(name string, a ...nc.Expr) {
 		blk.Directives = append(blk.Directives, &nc.Directive{
-			Name: "type",
-			Args: []nc.Expr{nc.Ident{Value: z.Type}},
+			Name: name,
+			Args: a,
 		})
+	}
+
+	if z.Type != "" {
+		add("type", nc.Ident{Value: z.Type})
 	}
 	if z.File != "" {
+		add("file", nc.StringLit{Value: z.File})
+	}
+	if z.AllowQuery != nil {
+		add("allow-query", *z.AllowQuery)
+	}
+	if z.AllowUpdate != nil {
+		add("allow-update", *z.AllowUpdate)
+	}
+	if z.AllowTransfer != nil {
+		add("allow-transfer", *z.AllowTransfer)
+	}
+	if z.AllowNotify != nil {
+		add("allow-notify", *z.AllowNotify)
+	}
+	if z.AlsoNotify != nil {
+		add("also-notify", *z.AlsoNotify)
+	}
+	if z.Masters != nil {
+		add("masters", *z.Masters)
+	}
+	if z.Forwarders != nil {
+		add("forwarders", *z.Forwarders)
+	}
+	if z.Forward != "" {
+		add("forward", nc.Ident{Value: z.Forward})
+	}
+	if z.Notify != "" {
+		add("notify", nc.Ident{Value: z.Notify})
+	}
+	if z.InlineSigning != nil {
+		if *z.InlineSigning {
+			add("inline-signing", nc.Ident{Value: "yes"})
+		} else {
+			add("inline-signing", nc.Ident{Value: "no"})
+		}
+	}
+	if z.IXFRFromDifferences != nil {
+		if *z.IXFRFromDifferences {
+			add("ixfr-from-differences", nc.Ident{Value: "yes"})
+		} else {
+			add("ixfr-from-differences", nc.Ident{Value: "no"})
+		}
+	}
+	if z.NotifyToSoa != nil {
+		if *z.NotifyToSoa {
+			add("notify-to-soa", nc.Ident{Value: "yes"})
+		} else {
+			add("notify-to-soa", nc.Ident{Value: "no"})
+		}
+	}
+	if z.AutoDNSSEC != "" {
+		add("auto-dnssec", nc.Ident{Value: z.AutoDNSSEC})
+	}
+	if z.DNSSECPolicy != "" {
+		add("dnssec-policy", nc.StringLit{Value: z.DNSSECPolicy})
+	}
+	if z.Journal != "" {
+		add("journal", nc.StringLit{Value: z.Journal})
+	}
+	if z.MaxJournalSize != "" {
+		add("max-journal-size", nc.Ident{Value: z.MaxJournalSize})
+	}
+	if z.UpdatePolicy != nil {
 		blk.Directives = append(blk.Directives, &nc.Directive{
-			Name: "file",
-			Args: []nc.Expr{nc.StringLit{Value: z.File}},
+			Name:  "update-policy",
+			Block: z.UpdatePolicy,
 		})
 	}
 
-	// Match groups
-	if z.AllowQuery != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "allow-query", Args: []nc.Expr{*z.AllowQuery}})
-	}
-	if z.AllowUpdate != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "allow-update", Args: []nc.Expr{*z.AllowUpdate}})
-	}
-	if z.AllowTransfer != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "allow-transfer", Args: []nc.Expr{*z.AllowTransfer}})
-	}
-	if z.AllowNotify != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "allow-notify", Args: []nc.Expr{*z.AllowNotify}})
-	}
-	if z.AlsoNotify != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "also-notify", Args: []nc.Expr{*z.AlsoNotify}})
-	}
-	if z.Masters != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "masters", Args: []nc.Expr{*z.Masters}})
-	}
-	if z.Forwarders != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "forwarders", Args: []nc.Expr{*z.Forwarders}})
-	}
-
-	// Simple tokens
-	if z.Forward != "" {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "forward", Args: []nc.Expr{nc.Ident{Value: z.Forward}}})
-	}
-	if z.Notify != "" {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "notify", Args: []nc.Expr{nc.Ident{Value: z.Notify}}})
-	}
-
-	// Booleans
-	if z.InlineSigning != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "inline-signing", Args: []nc.Expr{boolIdent(*z.InlineSigning)}})
-	}
-	if z.IXFRFromDifferences != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "ixfr-from-differences", Args: []nc.Expr{boolIdent(*z.IXFRFromDifferences)}})
-	}
-	if z.NotifyToSoa != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "notify-to-soa", Args: []nc.Expr{boolIdent(*z.NotifyToSoa)}})
-	}
-
-	// Strings
-	if z.AutoDNSSEC != "" {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "auto-dnssec", Args: []nc.Expr{nc.Ident{Value: z.AutoDNSSEC}}})
-	}
-	if z.DNSSECPolicy != "" {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "dnssec-policy", Args: []nc.Expr{nc.Ident{Value: z.DNSSECPolicy}}})
-	}
-	if z.Journal != "" {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "journal", Args: []nc.Expr{nc.StringLit{Value: z.Journal}}})
-	}
-	if z.MaxJournalSize != "" {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "max-journal-size", Args: []nc.Expr{nc.Ident{Value: z.MaxJournalSize}}})
-	}
-
-	// Complex
-	if z.UpdatePolicy != nil {
-		blk.Directives = append(blk.Directives, &nc.Directive{Name: "update-policy", Block: z.UpdatePolicy})
-	}
-
-	// Extras (deterministic order by key)
+	// extras (deterministic key order)
 	keys := make([]string, 0, len(z.Extras))
 	for k := range z.Extras {
 		keys = append(keys, k)
 	}
-	slices.Sort(keys)
+	sort.Strings(keys)
 	for _, k := range keys {
 		for _, occ := range z.Extras[k] {
-			blk.Directives = append(blk.Directives, &nc.Directive{Name: k, Args: stringsToExprs(occ)})
+			blk.Directives = append(blk.Directives, &nc.Directive{
+				Name: k,
+				Args: stringsToExprs(occ),
+			})
 		}
 	}
 
@@ -411,36 +690,27 @@ func zoneToDirective(z Zone) *nc.Directive {
 	return dir
 }
 
-// ----- tiny helpers for conversions -----
-
-func boolIdent(b bool) nc.Expr {
-	if b {
-		return nc.Ident{Value: "yes"}
-	}
-	return nc.Ident{Value: "no"}
-}
-
-func rawToken(e nc.Expr) string {
-	switch v := e.(type) {
-	case nc.StringLit:
-		return v.Value
-	case nc.Ident:
-		return v.Value
-	case nc.NumberLit:
-		return v.Raw
-	case nc.AddrLit:
-		return v.Raw
-	case nc.CIDRLit:
-		return v.Raw
-	default:
-		return fmt.Sprintf("%T", v)
-	}
-}
-
 func exprsToStrings(xs []nc.Expr) []string {
 	out := make([]string, 0, len(xs))
 	for _, e := range xs {
-		out = append(out, rawToken(e))
+		switch v := e.(type) {
+		case nc.StringLit:
+			out = append(out, v.Value)
+		case nc.Ident:
+			out = append(out, v.Value)
+		case nc.NumberLit:
+			out = append(out, v.Raw)
+		case nc.AddrLit:
+			out = append(out, v.Raw)
+		case nc.CIDRLit:
+			out = append(out, v.Raw)
+		// NOTE: we cannot render MatchGroup here without access to a public renderer;
+		// we store a placeholder to avoid compile errors and keep Extras lossless for non-groups.
+		case nc.MatchGroup:
+			out = append(out, "{...}")
+		default:
+			out = append(out, fmt.Sprintf("%T", v))
+		}
 	}
 	return out
 }
@@ -453,7 +723,6 @@ func stringsToExprs(ss []string) []nc.Expr {
 	return out
 }
 
-// guessExpr chooses a token representation for a raw string (best effort).
 func guessExpr(s string) nc.Expr {
 	if s == "" {
 		return nc.StringLit{Value: s}
@@ -468,97 +737,25 @@ func guessExpr(s string) nc.Expr {
 	}) != -1 {
 		return nc.StringLit{Value: s}
 	}
-	// Try CIDR/IP
-	if _, _, err := net.ParseCIDR(s); err == nil {
-		return nc.CIDRLit{Raw: s}
-	}
-	if ip := net.ParseIP(s); ip != nil {
-		return nc.AddrLit{Raw: s, IP: ip}
-	}
-	// fall back to ident
 	return nc.Ident{Value: s}
 }
 
-// asMatchGroup extracts a MatchGroup from a directive either via arg or block.
-func asMatchGroup(d *nc.Directive) *nc.MatchGroup {
-	// arg form
-	if len(d.Args) == 1 {
-		if g, ok := d.Args[0].(nc.MatchGroup); ok {
-			return &g
-		}
-	}
-	// block form: rebuild a MatchGroup from block items
-	if d.Block != nil {
-		g := blockToMG(d.Block)
-		return &g
-	}
-	return nil
-}
+// ===== Helpers to build match groups (optional niceties) =====
 
-// asBool parses yes|no from the first arg.
-func asBool(d *nc.Directive) (bool, bool) {
-	if len(d.Args) < 1 {
-		return false, false
-	}
-	switch strings.ToLower(rawToken(d.Args[0])) {
-	case "yes", "true", "on":
-		return true, true
-	case "no", "false", "off":
-		return false, true
-	default:
-		return false, false
-	}
-}
-
-// blockToMG reconstructs a MatchGroup from a block (best effort).
-// Mirrors the parser's internal logic.
-func blockToMG(blk *nc.Block) nc.MatchGroup {
-	mg := nc.MatchGroup{Pos: blk.Pos}
-	for _, d := range blk.Directives {
-		item := directiveToMatchItem(d)
-		mg.Items = append(mg.Items, &item)
-	}
-	return mg
-}
-
-func directiveToMatchItem(d *nc.Directive) nc.MatchItem {
-	parts := make([]nc.Expr, 0, 1+len(d.Args))
-	pos := d.Pos
-	name := d.Name
-	neg := false
-	if strings.HasPrefix(name, "!") {
-		neg = true
-		name = strings.TrimPrefix(name, "!")
-	}
-	// classify name
-	if _, _, err := net.ParseCIDR(name); err == nil {
-		parts = append(parts, nc.CIDRLit{Raw: name, Pos: pos})
-	} else if ip := net.ParseIP(name); ip != nil {
-		parts = append(parts, nc.AddrLit{Raw: name, IP: ip, Pos: pos})
-	} else {
-		parts = append(parts, nc.Ident{Value: name, Pos: pos})
-	}
-	parts = append(parts, d.Args...)
-	return nc.MatchItem{Parts: parts, Negated: neg, Pos: pos}
-}
-
-// ---------- Public helpers to build match-groups ----------
-
-func MG(items ...nc.MatchItem) nc.MatchGroup {
-	mg := nc.MatchGroup{Items: []*nc.MatchItem{}}
+func MG(items ...nc.MatchItem) *nc.MatchGroup {
+	g := nc.MatchGroup{Items: []*nc.MatchItem{}}
 	for i := range items {
 		it := items[i]
-		mg.Items = append(mg.Items, &it)
+		g.Items = append(g.Items, &it)
 	}
-	return mg
+	return &g
 }
 
 func Item(negated bool, parts ...nc.Expr) nc.MatchItem {
 	return nc.MatchItem{Negated: negated, Parts: parts}
 }
 
-// Id, Str, IP, CIDR helpers.
 func Ident(s string) nc.Expr { return nc.Ident{Value: s} }
 func Str(s string) nc.Expr   { return nc.StringLit{Value: s} }
-func IP(raw string) nc.Expr  { return nc.AddrLit{Raw: raw} }
-func CIDR(raw string) nc.Expr { return nc.CIDRLit{Raw: raw} }
+func IP(s string) nc.Expr    { return nc.AddrLit{Raw: s} }
+func CIDR(s string) nc.Expr  { return nc.CIDRLit{Raw: s} }

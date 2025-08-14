@@ -117,35 +117,35 @@ func atomicWrite(path string, data []byte, perm os.FileMode) error {
 
 // Zone represents a zone { ... } block.
 type Zone struct {
-	Name  string
-	Class string
-	Type  string // master|slave|hint|stub|forward|redirect
-	File  string
+	Name  string `json:"name,omitempty"`
+	Class string `json:"class,omitempty"`
+	Type  string `json:"type,omitempty"` // master|slave|hint|stub|forward|redirect
+	File  string `json:"file,omitempty"`
 
 	// Typed fields for common directives
-	AllowQuery    *nc.MatchGroup
-	AllowUpdate   *nc.MatchGroup
-	AllowTransfer *nc.MatchGroup
-	AllowNotify   *nc.MatchGroup
-	AlsoNotify    *nc.MatchGroup
-	Masters       *nc.MatchGroup
-	Forwarders    *nc.MatchGroup
+	AllowQuery    *nc.MatchGroup `json:"allow_query,omitempty"`
+	AllowUpdate   *nc.MatchGroup `json:"allow_update,omitempty"`
+	AllowTransfer *nc.MatchGroup `json:"allow_transfer,omitempty"`
+	AllowNotify   *nc.MatchGroup `json:"allow_notify,omitempty"`
+	AlsoNotify    *nc.MatchGroup `json:"also_notify,omitempty"`
+	Masters       *nc.MatchGroup `json:"masters,omitempty"`
+	Forwarders    *nc.MatchGroup `json:"forwarders,omitempty"`
 
-	Forward string // only|first
-	Notify  string // yes|no|explicit
+	Forward string `json:"forward,omitempty"` // only|first
+	Notify  string `json:"notify,omitempty"`  // yes|no|explicit
 
-	InlineSigning       *bool
-	IXFRFromDifferences *bool
-	NotifyToSoa         *bool
+	InlineSigning       *bool `json:"inline_signing,omitempty"`
+	IXFRFromDifferences *bool `json:"ixfr_from_differences,omitempty"`
+	NotifyToSoa         *bool `json:"notify_to_soa,omitempty"`
 
-	AutoDNSSEC     string
-	DNSSECPolicy   string
-	Journal        string
-	MaxJournalSize string
+	AutoDNSSEC     string `json:"autoDNSSEC,omitempty"`
+	DNSSECPolicy   string `json:"dns_sec_policy,omitempty"`
+	Journal        string `json:"journal,omitempty"`
+	MaxJournalSize string `json:"max_journal_size,omitempty"`
 
-	UpdatePolicy *nc.Block // keep raw
+	UpdatePolicy *nc.Block `json:"updatePolicy,omitempty"` // keep raw
 
-	Extras map[string][][]string
+	Extras map[string][][]string `json:"extras,omitempty"`
 
 	// internal
 	filePath string // which file this zone lives in

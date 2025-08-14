@@ -1,6 +1,6 @@
 # github.com/dlukt/namedzone
 
-A tiny Go library that adds **view-aware CRUD for `zone` blocks** in `named.conf`, built on top of the [`github.com/dlukt/namedconf`](https://github.com/dlukt/namedconf) parser/AST you provided.
+A tiny Go library that adds **view-aware CRUD for `zone` blocks** in `named.conf`, built on top of the [`github.com/dlukt/namedconf`](https://github.com/dlukt/namedconf) parser/AST.
 
 - Library only (no CLI)
 - Simple API

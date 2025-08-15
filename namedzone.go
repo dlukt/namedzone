@@ -129,6 +129,7 @@ type Zone struct {
 	AllowNotify   *nc.MatchGroup `json:"allow_notify,omitempty"`
 	AlsoNotify    *nc.MatchGroup `json:"also_notify,omitempty"`
 	Masters       *nc.MatchGroup `json:"masters,omitempty"`
+	Primaries     *nc.MatchGroup `json:"primaries,omitempty"`
 	Forwarders    *nc.MatchGroup `json:"forwarders,omitempty"`
 
 	Forward string `json:"forward,omitempty"` // only|first
@@ -478,6 +479,12 @@ func zoneFromDirective(d *nc.Directive, name string, filePath string) Zone {
 						z.Masters = &mg
 					}
 				}
+			case "primaries":
+				if len(cd.Args) == 1 {
+					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
+						z.Primaries = &mg
+					}
+				}
 			case "forwarders":
 				if len(cd.Args) == 1 {
 					if mg, ok := cd.Args[0].(nc.MatchGroup); ok {
@@ -621,6 +628,9 @@ func zoneToDirective(z Zone) *nc.Directive {
 	}
 	if z.Masters != nil {
 		add("masters", *z.Masters)
+	}
+	if z.Primaries != nil {
+		add("primaries", *z.Primaries)
 	}
 	if z.Forwarders != nil {
 		add("forwarders", *z.Forwarders)

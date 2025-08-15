@@ -769,3 +769,8 @@ func Ident(s string) nc.Expr { return nc.Ident{Value: s} }
 func Str(s string) nc.Expr   { return nc.StringLit{Value: s} }
 func IP(s string) nc.Expr    { return nc.AddrLit{Raw: s} }
 func CIDR(s string) nc.Expr  { return nc.CIDRLit{Raw: s} }
+
+// FilePath returns the file path where this zone is defined
+func (z Zone) FilePath() string {
+	return z.filePath
+}
